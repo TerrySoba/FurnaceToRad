@@ -57,6 +57,7 @@ class Instrument:
 @dataclass
 class SongData:
     speed: int
+    pattern_length: int
     orders: list[int]
     patterns_by_order: dict[int, list[str]]
     pattern_for_number: dict[int, list[str]]
@@ -75,6 +76,7 @@ def parse_song(text: str) -> SongData:
 
     instruments = parse_instruments(lines)
     speed = parse_speed(lines)
+    pattern_length = parse_pattern_length(lines)
     orders = parse_orders(lines)
     patterns_by_order = parse_order_patterns(lines)
 
@@ -88,6 +90,7 @@ def parse_song(text: str) -> SongData:
 
     return SongData(
         speed=speed,
+        pattern_length=pattern_length,
         orders=orders,
         patterns_by_order=patterns_by_order,
         pattern_for_number=pattern_for_number,
@@ -96,18 +99,51 @@ def parse_song(text: str) -> SongData:
 
 
 def parse_speed(lines: list[str]) -> int:
+    # Find tick rate and speed
+    tick_rate_line = next((line for line in lines if line.strip().startswith("- tick rate:")), None)
     speed_line = next((line for line in lines if line.strip().startswith("- speeds:")), None)
+    
     if speed_line is None:
         raise ValueError("Could not find speed in Furnace text export.")
+    
+    # Parse tick rate (default 60Hz for most trackers)
+    tick_rate = 60
+    if tick_rate_line:
+        tick_rate_text = tick_rate_line.split(":", 1)[1].strip()
+        tick_rate = int(tick_rate_text)
+    
+    # Parse speed (ticks per row)
     speed_text = speed_line.split(":", 1)[1].strip()
     if "," in speed_text:
         speed_text = speed_text.split(",", 1)[0].strip()
-    speed = int(speed_text)
-    if speed < 1:
-        speed = 1
-    if speed > 31:
-        speed = 31
-    return speed
+    furnace_speed = int(speed_text)
+    
+    # Convert to RAD speed: RAD uses 50Hz timer
+    # Furnace rows/sec = tick_rate / furnace_speed
+    # RAD speed needed = 50 / (tick_rate / furnace_speed) = 50 * furnace_speed / tick_rate
+    rad_speed = round(50 * furnace_speed / tick_rate)
+    
+    if rad_speed < 1:
+        rad_speed = 1
+    if rad_speed > 31:
+        rad_speed = 31
+    return rad_speed
+
+
+def parse_pattern_length(lines: list[str]) -> int:
+    pattern_length_line = next(
+        (line for line in lines if line.strip().startswith("- pattern length:")),
+        None,
+    )
+    if pattern_length_line is None:
+        raise ValueError("Could not find pattern length in Furnace text export.")
+
+    pattern_length = int(pattern_length_line.split(":", 1)[1].strip())
+    if pattern_length < 1:
+        raise ValueError("Pattern length must be at least 1.")
+    if pattern_length > 64:
+        raise ValueError("Pattern length above 64 is not supported by RAD.")
+    return pattern_length
 
 
 def parse_instruments(lines: list[str]) -> dict[int, Instrument]:
@@ -330,6 +366,12 @@ def encode_note(note_token: str, instrument: int, effect: int, param: int) -> by
         if pitch not in NOTE_TO_RAD:
             raise ValueError(f"Unsupported note token: {note_token}")
         note_value = NOTE_TO_RAD[pitch]
+        
+        # RAD octave boundary is at C#, Furnace is at C
+        # So Furnace C-3 → RAD octave 2, note 12
+        # But Furnace C#3 → RAD octave 3, note 1
+        if pitch == "C-":
+            octave -= 1
 
     byte0 = ((instrument >> 4) & 0x01) << 7
     byte0 |= (octave & 0x07) << 4
@@ -341,34 +383,74 @@ def encode_note(note_token: str, instrument: int, effect: int, param: int) -> by
     return bytes([byte0, byte1])
 
 
-def encode_pattern(rows: list[str], used_instruments: set[int]) -> bytes:
+def parse_pattern_row(row: str) -> tuple[int, list[tuple[str, str, int, int]]]:
+    line_index_text, cells_text = row.split("|", 1)
+    line_index = int(line_index_text.strip(), 16)
+    cells = cells_text.split("|")
+    if len(cells) < CHANNEL_COUNT:
+        raise ValueError(f"Pattern row has fewer than {CHANNEL_COUNT} channels: {row}")
+
+    channel_entries: list[tuple[str, str, int, int]] = []
+    for channel in range(CHANNEL_COUNT):
+        cell = cells[channel].strip()
+        parts = cell.split()
+        if len(parts) < 4:
+            raise ValueError(f"Unexpected cell format: {cell}")
+
+        note_token = parts[0]
+        inst_token = parts[1]
+        effect, parameter = parse_effect(parts[3])
+        channel_entries.append((note_token, inst_token, effect, parameter))
+
+    return line_index, channel_entries
+
+
+def inject_pattern_break(
+    row_entries: dict[int, list[tuple[str, str, int, int]]], pattern_length: int
+) -> None:
+    if pattern_length >= 64:
+        return
+
+    break_line = pattern_length - 1
+    channel_entries = row_entries.setdefault(
+        break_line,
+        [("...", "..", 0, 0) for _ in range(CHANNEL_COUNT)],
+    )
+
+    for channel, (note_token, inst_token, effect, parameter) in enumerate(channel_entries):
+        if effect == 0x0D and parameter == 0:
+            return
+        if effect == 0:
+            channel_entries[channel] = (note_token, inst_token, 0x0D, 0)
+            return
+
+    raise ValueError(
+        f"Cannot inject RAD pattern break on line {break_line:02X}; all channels already use effects."
+    )
+
+
+def encode_pattern(rows: list[str], used_instruments: set[int], pattern_length: int) -> bytes:
     encoded_lines: list[tuple[int, bytes]] = []
+    row_entries: dict[int, list[tuple[str, str, int, int]]] = {}
 
     for row in rows:
-        line_index_text, cells_text = row.split("|", 1)
-        line_index = int(line_index_text.strip(), 16)
-        cells = cells_text.split("|")
-        if len(cells) < CHANNEL_COUNT:
-            raise ValueError(f"Pattern row has fewer than {CHANNEL_COUNT} channels: {row}")
+        line_index, channel_entries = parse_pattern_row(row)
+        row_entries[line_index] = channel_entries
+
+    inject_pattern_break(row_entries, pattern_length)
+
+    for line_index in sorted(row_entries):
+        channel_entries = row_entries[line_index]
 
         channel_events: list[tuple[int, bytes]] = []
         for channel in range(CHANNEL_COUNT):
-            cell = cells[channel].strip()
-            parts = cell.split()
-            if len(parts) < 4:
-                raise ValueError(f"Unexpected cell format: {cell}")
-
-            note_token = parts[0]
-            inst_token = parts[1]
-            effect_token = parts[3]
+            note_token, inst_token, effect, parameter = channel_entries[channel]
 
             instrument = 0
             if inst_token != "..":
                 furnace_inst = int(inst_token, 16)
                 instrument = furnace_inst + 1
                 used_instruments.add(furnace_inst)
-
-            effect, parameter = parse_effect(effect_token)
 
             if note_token == "..." and instrument == 0 and effect == 0:
                 continue
@@ -404,7 +486,7 @@ def build_rad(song: SongData) -> bytes:
 
     pattern_data: dict[int, bytes] = {}
     for pattern_number, rows in song.pattern_for_number.items():
-        pattern_data[pattern_number] = encode_pattern(rows, used_instruments)
+        pattern_data[pattern_number] = encode_pattern(rows, used_instruments, song.pattern_length)
 
     module = bytearray()
     module.extend(RAD_MAGIC)
