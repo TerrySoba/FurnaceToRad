@@ -1,0 +1,27 @@
+= FurnaceToRad
+
+image:https://img.shields.io/badge/License-MIT-yellow.svg[License: MIT, link=LICENSE]
+
+Convert a Furnace text export that uses OPL2 (`Yamaha YM3812`) into a binary `.RAD` module that can be loaded by Reality Adlib Tracker.
+
+== What this supports
+
+* Furnace *text export* input (`# Furnace Text Export`)
+* OPL2 songs (`- system: Yamaha YM3812 (OPL2)`)
+* 9 OPL2 channels
+* Instrument conversion from Furnace FM params to RAD/HSC instrument bytes
+* Order list + pattern conversion (notes, key-off, instrument changes)
+
+== Quick start
+
+[source,bash]
+----
+python3 furnace_to_rad.py example_songs/example_song.txt example_songs/example_song.rad
+----
+
+That command writes `example_songs/example_song.rad`.
+
+== Notes
+
+* RAD has one global order list; if your Furnace export uses per-channel order differences, conversion stops with an error.
+* Pattern effect conversion is intentionally minimal right now; unsupported effects are ignored.
