@@ -383,14 +383,21 @@ def encode_note(note_token: str, instrument: int, effect: int, param: int) -> by
     return bytes([byte0, byte1])
 
 
-def parse_pattern_row(row: str) -> tuple[int, list[tuple[str, str, int, int]]]:
+def parse_volume(vol_token: str) -> int:
+    """Parse the Furnace volume column. Returns -1 for empty, 0-63 for a value."""
+    if vol_token == "..":
+        return -1
+    return int(vol_token, 16)
+
+
+def parse_pattern_row(row: str) -> tuple[int, list[tuple[str, str, int, int, int]]]:
     line_index_text, cells_text = row.split("|", 1)
     line_index = int(line_index_text.strip(), 16)
     cells = cells_text.split("|")
     if len(cells) < CHANNEL_COUNT:
         raise ValueError(f"Pattern row has fewer than {CHANNEL_COUNT} channels: {row}")
 
-    channel_entries: list[tuple[str, str, int, int]] = []
+    channel_entries: list[tuple[str, str, int, int, int]] = []
     for channel in range(CHANNEL_COUNT):
         cell = cells[channel].strip()
         parts = cell.split()
@@ -399,14 +406,15 @@ def parse_pattern_row(row: str) -> tuple[int, list[tuple[str, str, int, int]]]:
 
         note_token = parts[0]
         inst_token = parts[1]
+        volume = parse_volume(parts[2])
         effect, parameter = parse_effect(parts[3])
-        channel_entries.append((note_token, inst_token, effect, parameter))
+        channel_entries.append((note_token, inst_token, volume, effect, parameter))
 
     return line_index, channel_entries
 
 
 def inject_pattern_break(
-    row_entries: dict[int, list[tuple[str, str, int, int]]], pattern_length: int
+    row_entries: dict[int, list[tuple[str, str, int, int, int]]], pattern_length: int
 ) -> None:
     if pattern_length >= 64:
         return
@@ -414,14 +422,14 @@ def inject_pattern_break(
     break_line = pattern_length - 1
     channel_entries = row_entries.setdefault(
         break_line,
-        [("...", "..", 0, 0) for _ in range(CHANNEL_COUNT)],
+        [("...", "..", -1, 0, 0) for _ in range(CHANNEL_COUNT)],
     )
 
-    for channel, (note_token, inst_token, effect, parameter) in enumerate(channel_entries):
+    for channel, (note_token, inst_token, volume, effect, parameter) in enumerate(channel_entries):
         if effect == 0x0D and parameter == 0:
             return
         if effect == 0:
-            channel_entries[channel] = (note_token, inst_token, 0x0D, 0)
+            channel_entries[channel] = (note_token, inst_token, -1, 0x0D, 0)
             return
 
     raise ValueError(
@@ -431,7 +439,7 @@ def inject_pattern_break(
 
 def encode_pattern(rows: list[str], used_instruments: set[int], pattern_length: int) -> bytes:
     encoded_lines: list[tuple[int, bytes]] = []
-    row_entries: dict[int, list[tuple[str, str, int, int]]] = {}
+    row_entries: dict[int, list[tuple[str, str, int, int, int]]] = {}
 
     for row in rows:
         line_index, channel_entries = parse_pattern_row(row)
@@ -444,13 +452,29 @@ def encode_pattern(rows: list[str], used_instruments: set[int], pattern_length: 
 
         channel_events: list[tuple[int, bytes]] = []
         for channel in range(CHANNEL_COUNT):
-            note_token, inst_token, effect, parameter = channel_entries[channel]
+            note_token, inst_token, volume, effect, parameter = channel_entries[channel]
 
             instrument = 0
             if inst_token != "..":
                 furnace_inst = int(inst_token, 16)
                 instrument = furnace_inst + 1
                 used_instruments.add(furnace_inst)
+
+            # Resolve volume column into RAD effect C (set volume)
+            if volume >= 0:
+                if volume > 63:
+                    volume = 63
+                if effect != 0:
+                    import sys
+                    print(
+                        f"Warning: row {line_index:02X} ch {channel}: "
+                        f"volume column ({volume:02X}) dropped; "
+                        f"effect {effect:X}{parameter:02X} takes priority.",
+                        file=sys.stderr,
+                    )
+                else:
+                    effect = 0x0C
+                    parameter = volume
 
             if note_token == "..." and instrument == 0 and effect == 0:
                 continue
