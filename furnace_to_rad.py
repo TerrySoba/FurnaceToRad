@@ -109,10 +109,15 @@ def parse_speed(lines: list[str]) -> int:
         raise ValueError("Could not find speed in Furnace text export.")
     
     # Parse tick rate (default 60Hz for most trackers)
-    tick_rate = 60
+    tick_rate = 60.0
     if tick_rate_line:
         tick_rate_text = tick_rate_line.split(":", 1)[1].strip()
-        tick_rate = int(tick_rate_text)
+        match = re.match(r"[0-9]*\.?[0-9]+", tick_rate_text)
+        if match is None:
+            raise ValueError(f"Could not parse tick rate: {tick_rate_text!r}")
+        tick_rate = float(match.group(0))
+        if tick_rate <= 0:
+            raise ValueError(f"Tick rate must be positive: {tick_rate_text!r}")
     
     # Parse speed (ticks per row)
     speed_text = speed_line.split(":", 1)[1].strip()
